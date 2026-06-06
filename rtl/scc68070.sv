@@ -93,11 +93,13 @@ module scc68070 (
         bit reserved;
     } timer_status_register;
 
-
     bit [15:0] internal_data_in;
 
-    // UART is from 0x1008 to 0x100D
-    wire soc_periph = internal_addr[31];
+    // According to the datasheet, the access is internal if
+    // SUPERVISOR==1 && A[31:30]==2'b10;
+    // everything else is external
+    // Supervisor mode can be extracted using FC2
+    wire soc_periph = internal_addr[31:30] == 2'b10 && fc[2];
 
     wire internal_lds = !internal_LDSn;
     wire internal_uds = !internal_UDSn;
@@ -207,7 +209,7 @@ module scc68070 (
         .data_in(internal_data_in),
         .IPL(~ipl),
         .IPL_autovector(autovector_q),
-        .berr(bus_err),
+        .berr(bus_err && !irq_ack),
         .addr_out(internal_addr),
         .FC(fc),
         .data_write(data_out),
@@ -256,8 +258,8 @@ module scc68070 (
 
     bit [15:0] timer_reload_register  /*verilator public_flat_rd*/;
     bit [15:0] timer0  /*verilator public_flat_rd*/;
-    bit [15:0] timer1;
-    bit [15:0] timer2;
+    bit [15:0] timer1;  // unused in the CD-i
+    bit [15:0] timer2;  // unused in the CD-i
 
     always_ff @(posedge clk) begin
         if (reset) begin
