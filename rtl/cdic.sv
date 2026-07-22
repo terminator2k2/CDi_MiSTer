@@ -175,7 +175,6 @@ module cdic (
     bit [12:0] mem_cd_audio_addr;  // Address for CDIC memory
     bit mem_cd_audio_rd;
     bit mem_cd_audio_ack;
-    bit mem_cd_audio_ack_q;
 
     header_submode_s header_submode;
     header_coding_s header_coding;
@@ -190,8 +189,8 @@ module cdic (
     bit [15:0] header_timecode1;  // For inserting the timecode after reception
     bit [15:0] header_timecode2;  // For inserting the timecode after reception
 
-    wire signed [15:0] adpcm_left  /*verilator public_flat_rd*/;
-    wire signed [15:0] adpcm_right  /*verilator public_flat_rd*/;
+    wire signed [15:0] adpcm_left  /* verilator public_flat_rd */;
+    wire signed [15:0] adpcm_right  /* verilator public_flat_rd */;
 
     assign audio_left  = adpcm_left;
     assign audio_right = adpcm_right;
@@ -215,6 +214,7 @@ module cdic (
         .start_playback(audio_start_playback),
         .stop_playback(audio_stop_playback),
         .cdda_mode(read_cdda),
+        .last_refreshed_buffer(data_buffer_register[0]),
         .playback_active(audio_playback_active),
         .finished_buffer_playback(finished_audio_buffer_playback),
         .decoder_disable_audiomap(decoder_disable_audiomap),
@@ -263,10 +263,6 @@ module cdic (
         end
     end
 
-    always_ff @(posedge clk) begin
-        if (reset) mem_cd_audio_ack_q <= 0;
-        else mem_cd_audio_ack_q <= mem_cd_audio_ack;
-    end
     wire access = cs && (uds || lds);
 
     struct packed {
@@ -337,7 +333,9 @@ module cdic (
     end
 `endif
 
-    assign intreq = (x_buffer_register[15] & data_buffer_register[14]) | audio_buffer_register[15];
+    assign intreq = (x_buffer_register[15] & data_buffer_register[14]) |
+                    (audio_buffer_register[15] & audio_control_register[13]);
+
     assign req = dma_control_register[15];
 
     localparam kSectorHeader_Mode = 15 / 2;  // Low Byte
@@ -533,13 +531,15 @@ module cdic (
                 end
             end
 
-            // Audio map finished? Cause an IRQ to inform the CPU
-            if (finished_audio_buffer_playback && audio_control_register[13]) begin
+            // Audio buffer finished? Set highest bit of the audio buffer register
+            if (finished_audio_buffer_playback) begin
                 audio_buffer_register[15] <= 1;
             end
 
             if (decoder_disable_audiomap) begin
+                // Indicate 0xff coding with bit 0
                 audio_control_register[0]  <= 1;
+                // Also reset the "Playback enable" bit
                 audio_control_register[11] <= 0;
             end
 
