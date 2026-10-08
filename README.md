@@ -107,7 +107,10 @@ Note*: 2 controllers are an unusual state for a CD-i machine. Keep that in mind.
 
 By the time of writing, an optical drive emulator is not available for physical CD-i machines.
 It is therefore encouraged to test on CD-i emulators before burning to disc.
+
 [This core can be used to test your creations to some extent](doc/cdi_homebrew.md)
+
+[If extensive debugging is required, a software emulator might be a better choice](doc/other_emulators.md)
 
 ### Issues with external dependencies
 
@@ -127,6 +130,14 @@ Even so, the [sim](sim) folder seems to be the correct one, it is deprecated.
 It was used for mixed language simulation with the free version of ModelSim when the project has started.
 
 The [sim2](sim2) folder is the current one, used for most development and makes use of Verilator for improved performance.
+
+## Building with docker
+
+This replicates the process of https://github.com/MiSTer-unstable-nightlies but allows interaction with the container
+
+	docker run --mount type=bind,src=$(pwd),dst=/home/ --rm -it --entrypoint bash theypsilon/quartus-lite-c5:17.0.2.docker0
+	cd /home
+	time /opt/intelFPGA_lite/quartus/bin/quartus_sh --flow compile CDi.qsf
 
 ## Used resources
 

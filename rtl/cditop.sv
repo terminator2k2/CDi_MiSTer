@@ -15,7 +15,7 @@ module cditop (
     input [1:0] debug_force_video_plane,
     input [1:0] debug_limited_to_full,
     input audio_cd_in_tray,
-    input debug_disable_audio_attenuation,
+    input [2:0] config_audio_mixing,
 
     output bit ce_pix,
     output bit HBlank,
@@ -81,6 +81,7 @@ module cditop (
     output fail_not_enough_words,
     output fail_too_much_data,
     input config_disable_cpu_starve,
+    input config_rgb888,
     input config_auto_play,
     input config_disable_vmpeg,
     input [64:0] hps_rtc
@@ -186,6 +187,7 @@ module cditop (
     end
 
 
+    /* verilator tracing_off */
     mk48t08b mk48t (
         .clk(clk30),
         .reset,
@@ -205,6 +207,7 @@ module cditop (
 
         .hps_rtc(hps_rtc)
     );
+    /* verilator tracing_on */
 
     wire vdsc_int  /*verilator public_flat_rd*/;
 
@@ -213,7 +216,7 @@ module cditop (
     // video mixing. But we won't do that here and use the digital
     // one instead
     wire mcd212_vsd;
-
+    /* verilator tracing_off */
     mcd212 mcd212_inst (
         .clk(clk30),
         .reset,
@@ -248,9 +251,10 @@ module cditop (
         .debug_force_video_plane,
         .debug_limited_to_full,
         // Don't starve the CPU during DMA transfers
-        .disable_cpu_starve(config_disable_cpu_starve || cdic_dma_ack || cdic_dma_req)
+        .config_disable_cpu_starve(config_disable_cpu_starve || cdic_dma_ack || cdic_dma_req),
+        .config_rgb888
     );
-
+    /*verilator tracing_on*/
 
     // DMA signals from CPU
     wire vmpeg_dma_ack;
@@ -342,8 +346,6 @@ module cditop (
 
     rgb888_s fmv_video_out;
     rgb888_s mcd212_video_out;
-    wire debug_video_fifo_overflow;
-    wire debug_audio_fifo_overflow;
     linear_volume_s mpeg_dsp_volume;
 
     vmpeg vmpeg_inst (
@@ -370,8 +372,6 @@ module cditop (
         .debug_disable_vcd_clock,
         .debug_activate_vcd_filter,
         .mpeg_ram_enabled(mpeg_ram_enabled),
-        .debug_video_fifo_overflow(debug_video_fifo_overflow),
-        .debug_audio_fifo_overflow(debug_audio_fifo_overflow),
         .hsync(HSync),
         .vsync(VSync),
         .hblank(HBlank),
@@ -410,7 +410,7 @@ module cditop (
     );
 `endif
 
-    /*verilator tracing_off*/
+    /* verilator tracing_off */
     scc68070 scc68070_0 (
         .clk(clk30),
         .reset(reset68k),  // External sync reset on emulated system
@@ -564,7 +564,7 @@ module cditop (
 `endif
     wire signed [15:0] att_audio_left;
     wire signed [15:0] att_audio_right;
-
+    /* verilator tracing_off */
     dual_ad7528_attenuation att (
         .clk(clk30),
         .datadac(datadac),
@@ -580,8 +580,35 @@ module cditop (
         .audio_right_out(att_audio_right)
     );
 
-    assign audio_left  = debug_disable_audio_attenuation ? cdic_audio_left : att_audio_left;
-    assign audio_right = debug_disable_audio_attenuation ? cdic_audio_right : att_audio_right;
+    always_ff @(posedge clk30) begin
+        case (config_audio_mixing)
+            0: begin  // Original
+                audio_left  <= att_audio_left;
+                audio_right <= att_audio_right;
+            end
+            1: begin  // CDIC unmixed
+                audio_left  <= cdic_audio_left;
+                audio_right <= cdic_audio_right;
+            end
+            2: begin  // VMPEG unmixed
+                audio_left  <= mpeg_audio_left;
+                audio_right <= mpeg_audio_right;
+            end
+            3: begin  // VMPEG only left
+                audio_left  <= mpeg_audio_left;
+                audio_right <= mpeg_audio_left;
+            end
+            4: begin  // VMPEG only right
+                audio_left  <= mpeg_audio_right;
+                audio_right <= mpeg_audio_right;
+            end
+            default: begin  // Just to be sure
+                audio_left  <= att_audio_left;
+                audio_right <= att_audio_right;
+            end
+        endcase
+
+    end
 
     u3090mg u3090mg (
         .clk(clk30),
@@ -600,6 +627,7 @@ module cditop (
         .cd_img_mounted(cd_img_mounted),
         .tray_is_closed
     );
+    /*verilator tracing_on*/
 
     always_comb begin
         slave_bus_ack = dtackslaven && !dtackslaven_q;
@@ -648,260 +676,8 @@ module cditop (
         endcase
     end
 
-
 `ifdef VERILATOR
-    // Only for gtkwave to align video images with the signals in the waveform
-    int frame_index  /*verilator public_flat_rw*/;
-
-    // Tool to observe variables in madriv module
-    struct {
-        bit [31:0] dma_addr;    // 0x122
-        bit [15:0] irq_stat;    // 0x120
-        bit [15:0] irq_enable;  // 0x150
-    } madriv = '{default: 0};
-    bit [23:0] madriv_static  /*verilator public_flat_rw*/ = 24'hdfb770;
-
-    always @(posedge clk30) begin
-        if (madriv_static != 0 && bus_ack && write_strobe) begin
-            if (addr_byte == madriv_static + 24'h122) begin
-                madriv.dma_addr[31:16] = cpu_data;
-                $display("FMA dma_addr = %x", {cpu_data, madriv.dma_addr[15:0]});
-            end
-
-            if (addr_byte == madriv_static + 24'h124) begin
-                madriv.dma_addr[15:0] = cpu_data;
-                $display("FMA dma_addr = %x", {madriv.dma_addr[31:16], cpu_data});
-            end
-
-            if (addr_byte == madriv_static + 24'h0150) begin
-                madriv.irq_stat = cpu_data;
-                $display("FMA irq_stat = %x", cpu_data);
-            end
-
-            if (addr_byte == madriv_static + 24'h0120) begin
-                madriv.irq_enable = cpu_data;
-                $display("FMA irq_enable = %x", cpu_data);
-            end
-        end
-    end
-
-    // Tool to observe variables in fdrvs1 module
-    struct {
-        bit [7:0] V_StepDone; // 0x17a char*
-        bit [7:0] V_BufStat;  // 0x17b char*
-        bit [7:0] V_UpdFlag;  // 0x12e char*
-        bit [15:0] V_Stat;    // 0x134
-        bit [15:0] V_VCMD;    // 0x16c
-        bit [15:0] V_Scroll;  // 0x16a
-        bit [15:0] V_DTSVal;  // 0x1c0
-        bit [31:0] V_SCR;     // 0xca
-        bit [15:0] V_Status;  // 0x136
-        bit [15:0] V_SigStat; // 0x13c
-        bit [15:0] V_AsyStat; // 0x16e
-        bit [31:0] V_Window;  // 0xe6
-        bit [31:0] V_DecOff;  // 0xea
-        bit [31:0] V_ScrOrg;  // 0xee
-        bit [31:0] V_ScrOff;  // 0xf2
-        bit [31:0] V_NISFnd;  // 0x170
-        bit [7:0]  V_PicRt; // 0x0x17f char*
-        bit [31:0] V_PWI; // 0x180
-        bit [15:0] V_PRPA; //0x194
-        bit [31:0] V_Speed; // 0x100
-        bit [15:0] V_PlayType; // 0x9a
-        bit [7:0] V_Sync;  // 0xc9 char*
-        bit [7:0] V_SyncDone;  // 0x12c char*
-        bit [15:0] V_LCntr;  // 0xac
-        bit [7:0] V_Frozen;  // 0xde char*
-        bit [31:0] V_PausedSCR; // 0x144
-        bit [31:0] V_ChipSpd; // 0x196 long*
-    } fdrvs1 = '{default: 0};
-    bit [23:0] fdrvs1_static  /*verilator public_flat_rw*/ = 24'hdfb180;
-    always @(posedge clk30) begin
-
-        if (fdrvs1_static != 0 && bus_ack && write_strobe) begin
-
-            if (addr_byte == fdrvs1_static + 24'h0136) begin
-                fdrvs1.V_Status = cpu_data;
-                $display("FMV V_Status = %d dez", cpu_data);
-            end
-            if (addr_byte == fdrvs1_static + 24'h013c) begin
-                fdrvs1.V_SigStat = cpu_data;
-                $display("FMV V_SigStat = %d dez", cpu_data);
-            end
-            if (addr_byte == fdrvs1_static + 24'h016e) begin
-                fdrvs1.V_AsyStat = cpu_data;
-                $display("FMV V_AsyStat = %x hex %d dez", cpu_data, cpu_data);
-            end
-            if (addr_byte == fdrvs1_static + 24'h0134) begin
-                fdrvs1.V_Stat = cpu_data;
-                $display("FMV V_Stat = %d dez", cpu_data);
-            end
-            if (addr_byte == fdrvs1_static + 24'h0194) begin
-                fdrvs1.V_PRPA = cpu_data;
-                $display("FMV V_PRPA = %d dez", cpu_data);
-            end
-            if (addr_byte == fdrvs1_static + 24'h009a) begin
-                fdrvs1.V_PlayType = cpu_data;
-                $display("FMV V_PlayType = %d dez", cpu_data);
-            end
-
-            // I assume that fdrvs1_static is always aligned to words
-            if (addr_byte == fdrvs1_static + 24'h017a && uds) begin  // Location is 0x17a -> high byte
-                fdrvs1.V_StepDone = cpu_data[15:8];
-                $display("FMV V_StepDone = %d dez", cpu_data[15:8]);
-            end
-
-            if (addr_byte == fdrvs1_static + 24'h017a && lds) begin  // Location is 0x17b -> low byte
-                fdrvs1.V_BufStat = cpu_data[7:0];
-                $display("FMV V_BufStat = %d dez", cpu_data[7:0]);
-            end
-
-            if (addr_byte == fdrvs1_static + 24'h012e && uds) begin  // Location is 0x12e -> high byte
-                fdrvs1.V_UpdFlag = cpu_data[15:8];
-                $display("FMV V_UpdFlag = %d dez", cpu_data[15:8]);
-            end
-
-            if (addr_byte == fdrvs1_static + 24'h017e && lds) begin  // Location is 0x17f -> low byte
-                fdrvs1.V_PicRt = cpu_data[7:0];
-                $display("FMV V_PicRt = %d dez", cpu_data[7:0]);
-            end
-
-            if (addr_byte == fdrvs1_static + 24'h00c8 && lds) begin  // Location is 0xc9 -> low byte
-                fdrvs1.V_Sync = cpu_data[7:0];
-                $display("FMV V_Sync = %d dez", cpu_data[7:0]);
-            end
-
-            if (addr_byte == fdrvs1_static + 24'h012c && uds) begin  // Location is 0x12c -> high byte
-                fdrvs1.V_SyncDone = cpu_data[7:0];
-                $display("FMV V_SyncDone = %d dez", cpu_data[7:0]);
-            end
-
-            if (addr_byte == fdrvs1_static + 24'h0de && uds) begin  // Location is 0xde -> high byte
-                fdrvs1.V_Frozen = cpu_data[7:0];
-                $display("FMV V_Frozen = %d dez", cpu_data[7:0]);
-            end
-
-            if (addr_byte == fdrvs1_static + 24'h00ac) begin
-                fdrvs1.V_LCntr = cpu_data;
-                $display("FMV V_LCntr = %x", cpu_data);
-            end
-
-            if (addr_byte == fdrvs1_static + 24'h016a) begin
-                fdrvs1.V_Scroll = cpu_data;
-                $display("FMV V_Scroll = %x", cpu_data);
-            end
-
-            if (addr_byte == fdrvs1_static + 24'h016c) begin
-                fdrvs1.V_VCMD = cpu_data;
-                $display("FMV V_VCMD = %x", cpu_data);
-            end
-
-            if (addr_byte == fdrvs1_static + 24'h01c0) begin
-                fdrvs1.V_DTSVal = cpu_data;
-                $display("FMV V_DTSVal = %x", cpu_data);
-            end
-
-            if (addr_byte == fdrvs1_static + 24'h0ca) begin
-                fdrvs1.V_SCR[31:16] = cpu_data;
-                $display("FMV V_SCR = %x", {cpu_data, fdrvs1.V_SCR[15:0]});
-            end
-
-            if (addr_byte == fdrvs1_static + 24'h0cc) begin
-                fdrvs1.V_SCR[15:0] = cpu_data;
-                $display("FMV V_SCR = %x", {fdrvs1.V_SCR[31:16], cpu_data});
-            end
-
-            if (addr_byte == fdrvs1_static + 24'h0e6) begin
-                fdrvs1.V_Window[31:16] = cpu_data;
-                $display("FMV V_Window = %x", {cpu_data, fdrvs1.V_Window[15:0]});
-            end
-
-            if (addr_byte == fdrvs1_static + 24'h0e8) begin
-                fdrvs1.V_Window[15:0] = cpu_data;
-                $display("FMV V_Window = %x", {fdrvs1.V_Window[31:16], cpu_data});
-            end
-
-            if (addr_byte == fdrvs1_static + 24'h0ea) begin
-                fdrvs1.V_DecOff[31:16] = cpu_data;
-                $display("FMV V_DecOff = %x", {cpu_data, fdrvs1.V_DecOff[15:0]});
-            end
-
-            if (addr_byte == fdrvs1_static + 24'h0ec) begin
-                fdrvs1.V_DecOff[15:0] = cpu_data;
-                $display("FMV V_DecOff = %x", {fdrvs1.V_DecOff[31:16], cpu_data});
-            end
-
-            if (addr_byte == fdrvs1_static + 24'h0ee) begin
-                fdrvs1.V_ScrOrg[31:16] = cpu_data;
-                $display("FMV V_ScrOrg = %x", {cpu_data, fdrvs1.V_ScrOrg[15:0]});
-            end
-
-            if (addr_byte == fdrvs1_static + 24'h0f0) begin
-                fdrvs1.V_ScrOrg[15:0] = cpu_data;
-                $display("FMV V_ScrOrg = %x", {fdrvs1.V_ScrOrg[31:16], cpu_data});
-            end
-
-            if (addr_byte == fdrvs1_static + 24'h0f2) begin
-                fdrvs1.V_ScrOff[31:16] = cpu_data;
-                $display("FMV V_ScrOff = %x", {cpu_data, fdrvs1.V_ScrOff[15:0]});
-            end
-
-            if (addr_byte == fdrvs1_static + 24'h0f4) begin
-                fdrvs1.V_ScrOff[15:0] = cpu_data;
-                $display("FMV V_ScrOff = %x", {fdrvs1.V_ScrOff[31:16], cpu_data});
-            end
-
-            if (addr_byte == fdrvs1_static + 24'h170) begin
-                fdrvs1.V_NISFnd[31:16] = cpu_data;
-                $display("FMV V_NISFnd = %x", {cpu_data, fdrvs1.V_NISFnd[15:0]});
-            end
-
-            if (addr_byte == fdrvs1_static + 24'h172) begin
-                fdrvs1.V_NISFnd[15:0] = cpu_data;
-                $display("FMV V_NISFnd = %x", {fdrvs1.V_NISFnd[31:16], cpu_data});
-            end
-
-            if (addr_byte == fdrvs1_static + 24'h180) begin
-                fdrvs1.V_PWI[31:16] = cpu_data;
-                $display("FMV V_PWI = %x", {cpu_data, fdrvs1.V_PWI[15:0]});
-            end
-
-            if (addr_byte == fdrvs1_static + 24'h182) begin
-                fdrvs1.V_PWI[15:0] = cpu_data;
-                $display("FMV V_PWI = %x", {fdrvs1.V_PWI[31:16], cpu_data});
-            end
-
-            if (addr_byte == fdrvs1_static + 24'h100) begin
-                fdrvs1.V_Speed[31:16] = cpu_data;
-                $display("FMV V_Speed = %x", {cpu_data, fdrvs1.V_Speed[15:0]});
-            end
-
-            if (addr_byte == fdrvs1_static + 24'h102) begin
-                fdrvs1.V_Speed[15:0] = cpu_data;
-                $display("FMV V_Speed = %x", {fdrvs1.V_Speed[31:16], cpu_data});
-            end
-
-            if (addr_byte == fdrvs1_static + 24'h144) begin
-                fdrvs1.V_PausedSCR[31:16] = cpu_data;
-                $display("FMV V_PausedSCR = %x", {cpu_data, fdrvs1.V_PausedSCR[15:0]});
-            end
-
-            if (addr_byte == fdrvs1_static + 24'h146) begin
-                fdrvs1.V_PausedSCR[15:0] = cpu_data;
-                $display("FMV V_PausedSCR = %x", {fdrvs1.V_PausedSCR[31:16], cpu_data});
-            end
-
-            if (addr_byte == fdrvs1_static + 24'h196) begin
-                fdrvs1.V_ChipSpd[31:16] = cpu_data;
-                $display("FMV V_ChipSpd = %x", {cpu_data, fdrvs1.V_ChipSpd[15:0]});
-            end
-
-            if (addr_byte == fdrvs1_static + 24'h198) begin
-                fdrvs1.V_ChipSpd[15:0] = cpu_data;
-                $display("FMV V_ChipSpd = %x", {fdrvs1.V_ChipSpd[31:16], cpu_data});
-            end
-        end
-    end
+    `include "softstate_analysis.svh"
 `endif
 
 endmodule

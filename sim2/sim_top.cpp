@@ -1,9 +1,16 @@
 // Include common routines
+#include <algorithm>
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
+#include <sstream>
 #include <string>
 #include <sys/types.h>
 #include <vector>
 #include <verilated.h>
 #include <verilated_fst_c.h>
+#include <verilated_save.h>
 
 // Include model header, generated from Verilating "top.v"
 #include "Vemu.h"
@@ -12,19 +19,25 @@
 #include <chrono>
 #include <csignal>
 #include <cstdint>
-#include <png.h>
 
 #include "crc.h"
 #include "hle.h"
+#include "imgwrite.h"
 #include "scramble.h"
 #include "table_of_contents.h"
 #include <arpa/inet.h>
 #include <byteswap.h>
+#include <fcntl.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #define SCC68070
 #define SLAVE
-#define TRACE
 // #define SIMULATE_RC5
+// #define TRACE_ON_FMA
+// #define TRACE_ON_FMV
+// #define TRACE_FROM_START
+// #define TRACE_ON_CD_REQUEST
 
 #define PL_MPEG_IMPLEMENTATION
 #include "pl_mpeg_pc.h"
@@ -42,34 +55,6 @@ char GetPictureType(int val) {
     }
 }
 
-int WriteBmp(const char *path, int width, int height, uint8_t *pixels) {
-    FILE *fh = fopen(path, "wb");
-    if (!fh) {
-        return 0;
-    }
-
-    int padded_width = (width * 3 + 3) & (~3);
-    int padding = padded_width - (width * 3);
-    int data_size = padded_width * height;
-    int file_size = 54 + data_size;
-
-    fwrite("BM", 1, 2, fh);
-    fwrite(&file_size, 1, 4, fh);
-    fwrite("\x00\x00\x00\x00\x36\x00\x00\x00\x28\x00\x00\x00", 1, 12, fh);
-    fwrite(&width, 1, 4, fh);
-    fwrite(&height, 1, 4, fh);
-    fwrite("\x01\x00\x18\x00\x00\x00\x00\x00", 1, 8, fh); // planes, bpp, compression
-    fwrite(&data_size, 1, 4, fh);
-    fwrite("\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00", 1, 16, fh);
-
-    for (int y = height - 1; y >= 0; y--) {
-        fwrite(pixels + y * width * 3, 3, width, fh);
-        fwrite("\x00\x00\x00\x00", 1, padding, fh);
-    }
-    fclose(fh);
-    return file_size;
-}
-
 typedef struct {
     unsigned int width;
     unsigned int height;
@@ -77,12 +62,15 @@ typedef struct {
 } plm_plane2_t;
 
 typedef struct {
-    int32_t time;
     unsigned int width;
     unsigned int height;
     plm_plane2_t y;
     plm_plane2_t cr;
     plm_plane2_t cb;
+    int picture_type;
+    int temporal_ref;
+    int timecode;
+    int ready_for_display;
 } plm_frame2_t;
 
 #define BCD(v) ((uint8_t)((((v) / 10) << 4) | ((v) % 10)))
@@ -114,6 +102,8 @@ int toc_entry_count = 0;
 typedef VerilatedFstC tracetype_t;
 
 static bool do_trace{true};
+static bool do_trace_started_once_via_fma{false};
+static bool do_trace_started_once_via_fmv{false};
 #endif
 volatile sig_atomic_t status = 0;
 
@@ -123,18 +113,28 @@ const int size = width * height * 3;
 
 FILE *f_cd_bin{nullptr};
 FILE *f_sub_bin{nullptr};
+std::string mounted_image_path;
 
 template <typename T, typename U> constexpr T BIT(T x, U n) noexcept {
     return (x >> n) & T(1);
 }
 
-bool press_button1_signal{false};
-bool press_button2_signal{false};
+volatile sig_atomic_t press_button1_signal{false};
+volatile sig_atomic_t toggle_debug_signal{false};
 bool print_instructions{false};
 
-void SignalHandler(int signum, siginfo_t *info, void *context) {
-    fprintf(stderr, "Received signal %d\n", signum);
+void mount_image(const char *path) {
+    if (f_cd_bin) {
+        fclose(f_cd_bin);
+        f_cd_bin = nullptr;
+    }
 
+    f_cd_bin = fopen(path, "rb");
+    assert(f_cd_bin);
+    mounted_image_path = path;
+}
+
+void SignalHandler(int signum, siginfo_t *info, void *context) {
     switch (signum) {
     case SIGINT:
         // End simulation
@@ -147,15 +147,23 @@ void SignalHandler(int signum, siginfo_t *info, void *context) {
         break;
     case SIGUSR2:
         // example: killall -s USR2 Vemu
-#ifdef TRACE
-        do_trace = !do_trace;
-        fprintf(stderr, "Trace %s\n", do_trace ? "on" : "off");
-#else
-        print_instructions = !print_instructions;
-        fprintf(stderr, "Instruction Trace %s\n", print_instructions ? "on" : "off");
-#endif
+        toggle_debug_signal = true;
         break;
     }
+}
+
+void ProcessPendingSignals() {
+    if (!toggle_debug_signal)
+        return;
+
+    toggle_debug_signal = false;
+#ifdef TRACE
+    do_trace = !do_trace;
+    fprintf(stderr, "Trace %s\n", do_trace ? "on" : "off");
+#else
+    print_instructions = !print_instructions;
+    fprintf(stderr, "Instruction Trace %s\n", print_instructions ? "on" : "off");
+#endif
 }
 
 // got from mame
@@ -314,11 +322,10 @@ class CDi {
 #endif
 
     Vemu dut;
-    uint64_t time30mhz = 0;
-    uint64_t tracetime = 0;
-    int frame_index = 0;
-    int release_button_frame{-1};
-    int fmv_frame_cnt{0};
+
+    void EnablePngFrames() {
+        write_png_frames = true;
+    }
 
   private:
     FILE *f_audio_left{nullptr};
@@ -328,6 +335,8 @@ class CDi {
 
     FILE *f_fmv{nullptr};
     FILE *f_fmv_m1v{nullptr};
+    FILE *f_executed_events{nullptr};
+    bool write_png_frames{false};
 
     int fmv_index{0};
     /// @brief Used to decide whether a new index must be created
@@ -336,26 +345,134 @@ class CDi {
 
     FILE *f_uart{nullptr};
 
-    uint8_t output_image[size] = {0};
     uint32_t regfile[16];
 #ifdef TRACE
     tracetype_t m_trace;
 #endif
 
-    uint32_t prevpc = 0;
     SttFunction call_func;
 
-    int pixel_index = 0;
-
-    uint16_t hps_buffer[4096];
-    uint16_t hps_buffer_index = 0;
-    bool hps_nvram_backup_active{false};
-    bool ignore_first_hps_din{false};
-    bool executing_dvc_rom_instructions{false};
-
     int instanceid;
+    enum class InputKind {
+        Button1,
+        Button2,
+        Buttons1And2,
+        Analog,
+        TraceOn,
+        TraceOff,
+        InstructionsOn,
+        InstructionsOff,
+        Quit
+    };
+    struct InputEvent {
+        uint64_t frame;
+        InputKind kind;
+        unsigned int hold_frames{3};
+        uint8_t analog_x{0};
+        uint8_t analog_y{0};
+    };
 
-    std::chrono::_V2::system_clock::time_point start;
+    // Persistent host-side state. Keep operating-system resources (files,
+    // sockets, tracing) and the Verilated DUT out of this object: they are
+    // recreated when a process restarts, while the DUT saves itself.
+    struct TestbenchState {
+        static constexpr uint32_t kVersion{1};
+
+        uint32_t version{kVersion};
+        std::string image_path;
+        uint64_t time30mhz{0};
+        uint64_t tracetime{0};
+        uint32_t frame_index{0};
+        uint32_t fmv_frame_cnt{0};
+        uint16_t phase_accumulator{0};
+        uint32_t mpeg_clk_calc_ticks30{0};
+        uint32_t mpeg_clk_calc_ticks{0};
+        uint32_t pixel_index{0};
+        uint16_t hps_buffer_index{0};
+        bool hps_nvram_backup_active{false};
+        bool ignore_first_hps_din{false};
+        bool executing_dvc_rom_instructions{false};
+        uint32_t prevpc{0};
+        uint8_t held_buttons{0};
+        uint64_t button_release_frame[2]{0, 0};
+        uint16_t hps_buffer[4096]{};
+        uint8_t output_image[size]{};
+        std::vector<InputEvent> input_events;
+
+        void Save(VerilatedSave &os) const {
+            os << version << image_path << time30mhz << tracetime;
+            os << frame_index << fmv_frame_cnt << phase_accumulator;
+            os << mpeg_clk_calc_ticks30 << mpeg_clk_calc_ticks << pixel_index;
+            os << hps_buffer_index << hps_nvram_backup_active << ignore_first_hps_din;
+            os << executing_dvc_rom_instructions << prevpc << held_buttons;
+            os << button_release_frame[0] << button_release_frame[1];
+            os.write(hps_buffer, sizeof(hps_buffer));
+            os.write(output_image, sizeof(output_image));
+            const uint32_t event_count = input_events.size();
+            os << event_count;
+            for (const InputEvent &event : input_events)
+                os << event.frame << static_cast<uint8_t>(event.kind) << event.hold_frames << event.analog_x
+                   << event.analog_y;
+        }
+
+        bool Load(VerilatedRestore &os) {
+            os >> version >> image_path >> time30mhz >> tracetime;
+            os >> frame_index >> fmv_frame_cnt >> phase_accumulator;
+            os >> mpeg_clk_calc_ticks30 >> mpeg_clk_calc_ticks >> pixel_index;
+            os >> hps_buffer_index >> hps_nvram_backup_active >> ignore_first_hps_din;
+            os >> executing_dvc_rom_instructions >> prevpc >> held_buttons;
+            os >> button_release_frame[0] >> button_release_frame[1];
+            os.read(hps_buffer, sizeof(hps_buffer));
+            os.read(output_image, sizeof(output_image));
+            uint32_t event_count;
+            os >> event_count;
+            if (event_count > 1000000)
+                return false;
+            input_events.clear();
+            input_events.reserve(event_count);
+            for (uint32_t i = 0; i < event_count; ++i) {
+                InputEvent event{};
+                uint8_t kind;
+                os >> event.frame >> kind >> event.hold_frames >> event.analog_x >> event.analog_y;
+                if (kind > static_cast<uint8_t>(InputKind::Quit))
+                    return false;
+                event.kind = static_cast<InputKind>(kind);
+                input_events.push_back(event);
+            }
+            return true;
+        }
+    };
+
+    TestbenchState testbench;
+    uint64_t &time30mhz{testbench.time30mhz};
+    uint64_t &tracetime{testbench.tracetime};
+    uint32_t &frame_index{testbench.frame_index};
+    uint32_t &fmv_frame_cnt{testbench.fmv_frame_cnt};
+    uint16_t &phase_accumulator{testbench.phase_accumulator};
+    uint32_t &mpeg_clk_calc_ticks30{testbench.mpeg_clk_calc_ticks30};
+    uint32_t &mpeg_clk_calc_ticks{testbench.mpeg_clk_calc_ticks};
+    uint32_t &pixel_index{testbench.pixel_index};
+    uint16_t (&hps_buffer)[4096]{testbench.hps_buffer};
+    uint16_t &hps_buffer_index{testbench.hps_buffer_index};
+    bool &hps_nvram_backup_active{testbench.hps_nvram_backup_active};
+    bool &ignore_first_hps_din{testbench.ignore_first_hps_din};
+    bool &executing_dvc_rom_instructions{testbench.executing_dvc_rom_instructions};
+    uint32_t &prevpc{testbench.prevpc};
+    uint8_t (&output_image)[size]{testbench.output_image};
+    std::vector<InputEvent> &input_events{testbench.input_events};
+    int udp_fd{-1};
+    uint64_t (&button_release_frame)[2]{testbench.button_release_frame};
+    uint8_t &held_buttons{testbench.held_buttons};
+    uint64_t save_at_frame{UINT64_MAX};
+    std::string save_state_path;
+    bool save_at_lba_enabled{false};
+    uint32_t save_at_lba{0};
+    std::string save_lba_state_path;
+    enum class SaveRequest { None, Frame, Lba };
+    SaveRequest pending_save{SaveRequest::None};
+
+    std::chrono::_V2::system_clock::time_point start_time;
+    std::chrono::_V2::system_clock::time_point last_frame_time;
     static constexpr uint32_t kSectorHeaderSize{12};
     static constexpr uint32_t kSectorSize{2352};
     static constexpr uint32_t kSubcodeRWSize{96};
@@ -371,48 +488,73 @@ class CDi {
         return r | g | b;
     }
 
-    void write_png_file(const char *filename) {
-        FILE *fp = fopen(filename, "wb");
-        if (!fp)
-            abort();
-
-        png_structp png = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
-        if (!png)
-            abort();
-
-        png_infop info = png_create_info_struct(png);
-        if (!info)
-            abort();
-
-        if (setjmp(png_jmpbuf(png)))
-            abort();
-
-        png_init_io(png, fp);
-
-        int png_height_scale = 4;
-        int png_height = height * png_height_scale;
-        // Output is 8bit depth, RGBA format.
-        png_set_IHDR(png, info, width, png_height, 8, PNG_COLOR_TYPE_RGB, PNG_INTERLACE_NONE,
-                     PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
-        png_write_info(png, info);
-
-        png_bytepp row_pointers = (png_bytepp)png_malloc(png, sizeof(png_bytepp) * png_height);
-
-        for (int i = 0; i < png_height; i++) {
-            row_pointers[i] = &output_image[width * 3 * (i / png_height_scale)];
+  public:
+    bool SaveState(const char *path) {
+        VerilatedSave os;
+        os.open(path);
+        if (!os.isOpen()) {
+            fprintf(stderr, "Unable to write save state %s\n", path);
+            return false;
         }
-
-        png_write_image(png, row_pointers);
-        png_write_end(png, NULL);
-
-        free(row_pointers);
-
-        fclose(fp);
-
-        png_destroy_write_struct(&png, &info);
+        testbench.image_path = mounted_image_path;
+        testbench.Save(os);
+        os << dut;
+        fprintf(stderr, "Saved state at frame %d to %s\n", frame_index, path);
+        return true;
     }
 
-    uint16_t phase_accumulator;
+    bool LoadState(const char *path) {
+        VerilatedRestore os;
+        os.open(path);
+        if (!os.isOpen()) {
+            fprintf(stderr, "Unable to read save state %s\n", path);
+            return false;
+        }
+        if (!testbench.Load(os) || testbench.version != TestbenchState::kVersion ||
+            testbench.image_path != mounted_image_path) {
+            fprintf(stderr, "Save state %s is for a different format or CD image\n", path);
+            return false;
+        }
+        os >> dut;
+        dut.eval();
+        start_time = std::chrono::system_clock::now();
+        last_frame_time = start_time;
+        fprintf(stderr, "Loaded state at frame %d from %s\n", frame_index, path);
+        return true;
+    }
+
+    void SetSaveAtFrame(uint64_t frame, const char *path) {
+        save_at_frame = frame;
+        save_state_path = path;
+    }
+
+    void SetSaveAtLba(uint32_t lba, const char *path) {
+        save_at_lba_enabled = true;
+        save_at_lba = lba;
+        save_lba_state_path = path;
+    }
+
+  private:
+    void RequestSave(SaveRequest request) {
+        if (pending_save == SaveRequest::None)
+            pending_save = request;
+    }
+
+    void CommitPendingSave() {
+        if (pending_save == SaveRequest::None)
+            return;
+
+        const bool lba_request = pending_save == SaveRequest::Lba;
+        const char *path = lba_request ? save_lba_state_path.c_str() : save_state_path.c_str();
+        if (SaveState(path)) {
+            if (lba_request)
+                fprintf(stderr, "Saved state on seek LBA 0x%08x\n", save_at_lba);
+            status = SIGINT;
+        } else {
+            status = 1;
+        }
+        pending_save = SaveRequest::None;
+    }
 
     void clockmpeg() {
         mpeg_clk_calc_ticks++;
@@ -429,11 +571,6 @@ class CDi {
         }
     }
 
-    // These two are used to calculate the actual MPEG frequency
-    // required to do the job on a frame basis
-    uint32_t mpeg_clk_calc_ticks30{0}; ///< counts 30 MHz clock ticks
-    uint32_t mpeg_clk_calc_ticks{0};   ///< counts MPEG clock ticks
-
     /*
     Primarily creates a 30 MHz clock and
     derives 22.2264 MHz audio clock from that.
@@ -443,16 +580,22 @@ class CDi {
     */
     void clock30() {
         mpeg_clk_calc_ticks30++;
-        mpeg_clk_calc_ticks++;
 
         uint32_t fmv_fifo_level = dut.rootp->emu__DOT__cditop__DOT__vmpeg_inst__DOT__video__DOT__fifo_level;
+        uint32_t fmv_dsp_enable = dut.rootp->emu__DOT__cditop__DOT__vmpeg_inst__DOT__fmv_dsp_enable;
+
+        bool drive_mpeg_clock = fmv_dsp_enable;
+
+        if (drive_mpeg_clock)
+            mpeg_clk_calc_ticks++;
 
         for (int i = 0; i < 2; i++) {
             // clk_sys is 30 MHz
             dut.rootp->emu__DOT__clk_sys = (i & 1);
 
             // clk_mpeg is 30 MHz when no work is to be done
-            dut.rootp->emu__DOT__clk_mpeg = (i & 1);
+            if (drive_mpeg_clock)
+                dut.rootp->emu__DOT__clk_mpeg = (i & 1);
 
             // clk_audio is 6.615 MHz
             // 6.615 MHz * 2^15 / 30 MHz = 7225.344
@@ -470,35 +613,64 @@ class CDi {
 
         // The FPGA PLL is configured for 80 MHz, but
         // the power is not always required. Scale it up to 60 MHZ
-        if (fmv_fifo_level > 2000) {
+        if (drive_mpeg_clock && fmv_fifo_level > 2000 &&
+            dut.rootp->emu__DOT__cditop__DOT__vmpeg_inst__DOT__video__DOT__pictures_in_output_fifo < 3) {
             clockmpeg();
         }
 
         // Ok, scale it up to 90 MHz
-        if (fmv_fifo_level > 8000) {
+        if (drive_mpeg_clock && fmv_fifo_level > 8000 &&
+            dut.rootp->emu__DOT__cditop__DOT__vmpeg_inst__DOT__video__DOT__pictures_in_output_fifo < 3) {
             clockmpeg();
+        }
+    }
+
+    uint16_t *cpu_addr_map_memory(uint32_t addr, bool writing) {
+        // ensure alignment
+        assert((addr & 1) == 0);
+
+        if (addr < 0x080000) {
+            return &dut.rootp->emu__DOT__ram[(addr) >> 1]; // Video A bank
+        } else if (addr >= 0x200000 && addr < 0x280000) {
+            return &dut.rootp->emu__DOT__ram[(addr - 0x200000 + 0x80000) >> 1]; // Video B bank
+        } else if (addr >= 0x400000 && addr <= 0x4ffbff && !writing) {
+            return &dut.rootp->emu__DOT__rom[(addr - 0x400000) >> 1]; // System ROM
+        } else if (addr >= 0xd00000 && addr <= 0xdfffff) {
+            return &dut.rootp->emu__DOT__ram[(addr - 0xd00000 + 0x100000) >> 1]; // DVC RAM
+        } else if (addr >= 0xe80000 && addr <= 0xefffff) {
+            return &dut.rootp->emu__DOT__ram[(addr - 0xe80000 + 0x200000) >> 1]; // DVC MPEG RAM
+        } else if (addr >= 0xe40000 && addr < 0xe60000 && !writing) {
+            return &dut.rootp->emu__DOT__vmpega_rom[(addr - 0xe40000) >> 1]; // VMPEG ROM
+        } else if (addr >= 0xe60000 && addr < 0xe80000 && !writing) {
+            return &dut.rootp->emu__DOT__vmpega_rom[(addr - 0xe60000) >> 1]; // VMPEG ROM mirror
+        } else {
+            printf("Not mapped? %x\n", addr);
+            return nullptr;
+            // exit(1);
         }
     }
 
     /// @brief Reads from RAM based on CPU memory view
     uint16_t cpu_memory_read_u16(uint32_t addr) {
-        // ensure alignment
-        assert((addr & 1) == 0);
 
-        if (addr < 0x080000) {
-            return dut.rootp->emu__DOT__ram[(addr) >> 1]; // Video A bank
-        } else if (addr >= 0x200000 && addr < 0x280000) {
-            return dut.rootp->emu__DOT__ram[(addr - 0x200000 + 0x80000) >> 1]; // Video B bank
-        } else if (addr >= 0x400000 && addr <= 0x4ffbff) {
-            return dut.rootp->emu__DOT__rom[(addr - 0x400000) >> 1]; // System ROM
-        } else if (addr >= 0xd00000 && addr <= 0xdfffff) {
-            return dut.rootp->emu__DOT__ram[(addr - 0xd00000 + 0x100000) >> 1]; // DVC RAM
-        } else if (addr >= 0xe40000 && addr < 0xe60000) {
-            return dut.rootp->emu__DOT__vmpega_rom[(addr - 0xe40000) >> 1]; // VMPEG ROM
-        } else {
-            printf("Not mapped? %x\n", addr);
-            return 0;
-            // exit(1);
+        uint16_t *virt = cpu_addr_map_memory(addr, false);
+        if (virt) {
+            return *virt;
+        }
+        // exit(1);
+        return 0;
+    }
+
+    /// @brief Reads from RAM based on CPU memory view
+    void cpu_memory_write_u16(uint32_t addr, uint16_t data, bool uds, bool lds) {
+        uint16_t *virt = cpu_addr_map_memory(addr, true);
+        if (virt) {
+            if (uds && lds)
+                *virt = data;
+            else if (uds)
+                *virt = (*virt & 0x00ff) | (data & 0xff00);
+            else if (lds)
+                *virt = (*virt & 0xff00) | (data & 0x00ff);
         }
     }
 
@@ -672,6 +844,7 @@ class CDi {
 
             call_func = func;
         }
+
         if (static_cast<SystemCallType>(call) == SystemCallType::I_GetStt) {
             SttFunction func = static_cast<SttFunction>(cpu_d[1] & 0xffff);
             printf(" GetStt %s", sttFunctionToString(func));
@@ -697,107 +870,320 @@ class CDi {
         call_func = SS_Opt; // Invalidate
     }
 
-    // Keep pressing B1 until the broken game is reached
-    void lost_ride_pal() {
-        if (frame_index > 150) {
-            if ((frame_index % 40) == 10) {
-                press_button1_signal = true;
+    bool QueueInputEvent(uint64_t frame, const std::string &command, unsigned int hold_frames, const char *source,
+                         unsigned int line_number) {
+        InputKind kind;
+        if (command == "b1" || command == "button1")
+            kind = InputKind::Button1;
+        else if (command == "b2" || command == "button2")
+            kind = InputKind::Button2;
+        else if (command == "b1b2" || command == "both")
+            kind = InputKind::Buttons1And2;
+        else if (command == "trace_on")
+            kind = InputKind::TraceOn;
+        else if (command == "trace_off")
+            kind = InputKind::TraceOff;
+        else if (command == "instructions_on")
+            kind = InputKind::InstructionsOn;
+        else if (command == "instructions_off")
+            kind = InputKind::InstructionsOff;
+        else if (command == "quit")
+            kind = InputKind::Quit;
+        else {
+            fprintf(stderr, "%s:%u: unknown input command '%s'\n", source, line_number, command.c_str());
+            return false;
+        }
+        if ((kind == InputKind::Button1 || kind == InputKind::Button2 || kind == InputKind::Buttons1And2) &&
+            hold_frames == 0) {
+            fprintf(stderr, "%s:%u: hold_frames must be at least one\n", source, line_number);
+            return false;
+        }
+        input_events.push_back({frame, kind, hold_frames});
+        std::stable_sort(input_events.begin(), input_events.end(),
+                         [](const InputEvent &a, const InputEvent &b) { return a.frame < b.frame; });
+        return true;
+    }
+
+    bool QueueAnalogEvent(uint64_t frame, int x, int y, const char *source, unsigned int line_number) {
+        if (x < -128 || x > 127 || y < -128 || y > 127) {
+            fprintf(stderr, "%s:%u: analog coordinates must be between -128 and 127\n", source, line_number);
+            return false;
+        }
+        input_events.push_back({frame, InputKind::Analog, 0, static_cast<uint8_t>(static_cast<int8_t>(x)),
+                                static_cast<uint8_t>(static_cast<int8_t>(y))});
+        std::stable_sort(input_events.begin(), input_events.end(),
+                         [](const InputEvent &a, const InputEvent &b) { return a.frame < b.frame; });
+        return true;
+    }
+
+    void PollUdpInput() {
+        if (udp_fd < 0)
+            return;
+
+        char buffer[256];
+        while (true) {
+            const ssize_t received = recv(udp_fd, buffer, sizeof(buffer) - 1, 0);
+            if (received < 0) {
+                if (errno != EAGAIN && errno != EWOULDBLOCK)
+                    perror("recv");
+                return;
+            }
+            buffer[received] = '\0';
+            std::istringstream input(buffer);
+            std::string first;
+            std::string command;
+            unsigned int hold_frames = 3;
+            if (!(input >> first))
+                continue;
+
+            uint64_t frame = frame_index;
+            char *end = nullptr;
+            const unsigned long long parsed_frame = strtoull(first.c_str(), &end, 10);
+            if (*end == '\0') {
+                frame = parsed_frame;
+                if (!(input >> command)) {
+                    fprintf(stderr, "Ignoring malformed UDP input: %s\n", buffer);
+                    continue;
+                }
+            } else {
+                command = first;
+            }
+            if (command == "analog") {
+                int x;
+                int y;
+                std::string extra;
+                if (!(input >> x >> y) || (input >> extra) || !QueueAnalogEvent(frame, x, y, "UDP", 0))
+                    fprintf(stderr, "Ignoring malformed UDP input: %s\n", buffer);
+                continue;
+            }
+            bool valid = true;
+            if (input >> hold_frames) {
+                std::string extra;
+                valid = !(input >> extra);
+            } else if (!input.eof()) {
+                valid = false;
+            }
+            if (!valid || !QueueInputEvent(frame, command, hold_frames, "UDP", 0)) {
+                fprintf(stderr, "Ignoring malformed UDP input: %s\n", buffer);
             }
         }
     }
 
-    void PressEvery5Frames() {
-        if (frame_index > 200) {
-            if ((frame_index % 5) == 1) {
-                press_button1_signal = true;
-            }
-        }
-    }
-
-    void PlayAudioCdInxListenLikeThieves() {
-        if (frame_index == 190)
-            press_button1_signal = true;
-        if (frame_index == 261)
-            do_trace = true;
-        if (frame_index == 390)
-            do_trace = false;
-    }
-
-    void chaos_control_germany() {
-
-        if (frame_index > 1030) {
-            dut.rootp->emu__DOT__config_disable_seek_time = 0;
-            dut.rootp->emu__DOT__config_disable_cpu_starve = 0;
-
-            if ((frame_index % 100) == 10) {
-                press_button2_signal = true;
-            }
-
-            if ((frame_index % 100) == 30) {
-                press_button2_signal = true;
-            }
-
-            if ((frame_index % 100) == 50) {
-                press_button1_signal = true;
-            }
-
-            if ((frame_index % 100) == 70) {
-                press_button1_signal = true;
-            }
-        } else if (frame_index > 150) {
-            if ((frame_index % 20) == 10) {
-                press_button1_signal = true;
-            }
-        }
-    }
-
-    /// Presses buttons until game is reached
-    void space_ace_pal() {
-        switch (frame_index) {
-        case 154:
-            // Skip Philips Intro
-            press_button1_signal = true;
+    void RecordExecutedInputEvent(const InputEvent &event) {
+        assert(f_executed_events);
+        switch (event.kind) {
+        case InputKind::Button1:
+            fprintf(f_executed_events, "%d b1 %u\n", frame_index, event.hold_frames);
             break;
-        case 414:
-            // Skip SUPERCLUB company logo
-            press_button1_signal = true;
+        case InputKind::Button2:
+            fprintf(f_executed_events, "%d b2 %u\n", frame_index, event.hold_frames);
             break;
-        case 460:
-            // Skip game intro
-            press_button1_signal = true;
+        case InputKind::Buttons1And2:
+            // Write replayable individual events at the same frame.
+            fprintf(f_executed_events, "%d b1 %u\n%d b2 %u\n", frame_index, event.hold_frames, frame_index,
+                    event.hold_frames);
+            break;
+        case InputKind::Analog:
+            fprintf(f_executed_events, "%d analog %d %d\n", frame_index, static_cast<int8_t>(event.analog_x),
+                    static_cast<int8_t>(event.analog_y));
+            break;
+        case InputKind::TraceOn:
+            fprintf(f_executed_events, "%d trace_on\n", frame_index);
+            break;
+        case InputKind::TraceOff:
+            fprintf(f_executed_events, "%d trace_off\n", frame_index);
+            break;
+        case InputKind::InstructionsOn:
+            fprintf(f_executed_events, "%d instructions_on\n", frame_index);
+            break;
+        case InputKind::InstructionsOff:
+            fprintf(f_executed_events, "%d instructions_off\n", frame_index);
+            break;
+        case InputKind::Quit:
+            fprintf(f_executed_events, "%d quit\n", frame_index);
             break;
         }
+        fflush(f_executed_events);
     }
 
-    /// Presses buttons until game is reached
-    void braindead13_pal() {
-        switch (frame_index) {
-        case 250:
-            // Skip Philips Intro
-            press_button1_signal = true;
-            break;
-        case 300:
-            // Skip ICDI company logo
-            press_button1_signal = true;
-            break;
-        case 313:
+    void ApplyInputEvents() {
+        PollUdpInput();
+        if (press_button1_signal) {
+            press_button1_signal = false;
+            QueueInputEvent(frame_index, "b1", 3, "SIGUSR1", 0);
+        }
+
+        for (unsigned int button = 0; button < 2; button++) {
+            if (button_release_frame[button] != 0 && frame_index >= button_release_frame[button]) {
+                held_buttons &= ~(1u << button);
+                button_release_frame[button] = 0;
+                fprintf(stderr, "Release Button %u at frame %d\n", button + 1, frame_index);
+            }
+        }
+
+        while (!input_events.empty() && input_events.front().frame <= static_cast<uint64_t>(frame_index)) {
+            const InputEvent event = input_events.front();
+            input_events.erase(input_events.begin());
+            RecordExecutedInputEvent(event);
+            switch (event.kind) {
+            case InputKind::Button1:
+            case InputKind::Button2:
+            case InputKind::Buttons1And2: {
+                const unsigned int buttons = event.kind == InputKind::Button1   ? 1u
+                                             : event.kind == InputKind::Button2 ? 2u
+                                                                                : 3u;
+                held_buttons |= buttons;
+                for (unsigned int button = 0; button < 2; button++) {
+                    if (buttons & (1u << button)) {
+                        button_release_frame[button] = std::max(button_release_frame[button],
+                                                                static_cast<uint64_t>(frame_index) + event.hold_frames);
+                    }
+                }
+                fprintf(stderr, "Press Button%s%s at frame %d\n", buttons & 1 ? " 1" : "",
+                        buttons == 3  ? " + 2"
+                        : buttons & 2 ? " 2"
+                                      : "",
+                        frame_index);
+                break;
+            }
+            case InputKind::Analog:
+                // JOY0_ANALOG is { Y[7:0], X[7:0] }.
+                dut.rootp->emu__DOT__JOY0_ANALOG = (event.analog_y << 8) | event.analog_x;
+                fprintf(stderr, "Set analog X=%d Y=%d at frame %d\n", static_cast<int8_t>(event.analog_x),
+                        static_cast<int8_t>(event.analog_y), frame_index);
+                break;
+            case InputKind::TraceOn:
 #ifdef TRACE
-            do_trace = true;
-            fprintf(stderr, "Trace on!\n");
+                do_trace = true;
+                fprintf(stderr, "Trace on by Command at frame %d\n", frame_index);
 #endif
-            break;
-        case 365:
-            // status = 1;
-            // fprintf(stderr, "Stop!\n");
-            break;
-        case 460: // TODO index might be wrong
-            // Skip game intro
-            press_button1_signal = true;
-            break;
+                break;
+            case InputKind::TraceOff:
+#ifdef TRACE
+                do_trace = false;
+                fprintf(stderr, "Trace off by Command at frame %d\n", frame_index);
+#endif
+                break;
+            case InputKind::InstructionsOn:
+                print_instructions = true;
+                break;
+            case InputKind::InstructionsOff:
+                print_instructions = false;
+                break;
+            case InputKind::Quit:
+                status = SIGINT;
+                break;
+            }
         }
+        dut.rootp->emu__DOT__JOY0 = (held_buttons & 1 ? 0b010000 : 0) | (held_buttons & 2 ? 0b100000 : 0);
     }
 
   public:
+    // An explicit --events script is an input override, including after a
+    // save-state restore.  Live UDP events continue to append normally.
+    bool ReplaceInputEventsFromScript(const char *path) {
+        std::ifstream script(path);
+        if (!script) {
+            fprintf(stderr, "Unable to open event script %s\n", path);
+            return false;
+        }
+
+        input_events.clear();
+
+        std::string line;
+        unsigned int line_number = 0;
+        uint64_t previous_frame = 0;
+        while (std::getline(script, line)) {
+            line_number++;
+            const std::size_t comment = line.find('#');
+            if (comment != std::string::npos)
+                line.erase(comment);
+
+            std::istringstream input(line);
+            std::string frame_spec;
+            std::string command;
+            unsigned int hold_frames = 3;
+            if (!(input >> frame_spec))
+                continue;
+            char *end = nullptr;
+            errno = 0;
+            const unsigned long long parsed_frame = strtoull(frame_spec.c_str(), &end, 10);
+            if (*end != '\0' || errno == ERANGE || frame_spec == "-" || (!frame_spec.empty() && frame_spec[0] == '-')) {
+                fprintf(stderr, "%s:%u: expected a frame number or +<frame_increment>\n", path, line_number);
+                return false;
+            }
+            const bool relative_frame = !frame_spec.empty() && frame_spec[0] == '+';
+            uint64_t frame = parsed_frame;
+            if (relative_frame) {
+                if (frame > UINT64_MAX - previous_frame) {
+                    fprintf(stderr, "%s:%u: frame increment overflows\n", path, line_number);
+                    return false;
+                }
+                frame += previous_frame;
+            }
+            if (!(input >> command)) {
+                fprintf(stderr, "%s:%u: expected: <frame|+increment> <command> [hold_frames]\n", path, line_number);
+                return false;
+            }
+            if (command == "analog") {
+                int x;
+                int y;
+                std::string extra;
+                if (!(input >> x >> y) || (input >> extra)) {
+                    fprintf(stderr, "%s:%u: expected: <frame> analog <x> <y>\n", path, line_number);
+                    return false;
+                }
+                if (!QueueAnalogEvent(frame, x, y, path, line_number))
+                    return false;
+                previous_frame = frame;
+                continue;
+            }
+            if (input >> hold_frames) {
+                std::string extra;
+                if (input >> extra) {
+                    fprintf(stderr, "%s:%u: expected: <frame> <command> [hold_frames]\n", path, line_number);
+                    return false;
+                }
+            } else if (!input.eof()) {
+                fprintf(stderr, "%s:%u: invalid hold_frames\n", path, line_number);
+                return false;
+            }
+            if (!QueueInputEvent(frame, command, hold_frames, path, line_number))
+                return false;
+            previous_frame = frame;
+        }
+
+        fprintf(stderr, "Loaded %zu input events from %s\n", input_events.size(), path);
+        return true;
+    }
+
+    bool EnableUdpInput(uint16_t port) {
+        udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
+        if (udp_fd < 0) {
+            perror("socket");
+            return false;
+        }
+        const int flags = fcntl(udp_fd, F_GETFL, 0);
+        if (flags < 0 || fcntl(udp_fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+            perror("fcntl");
+            close(udp_fd);
+            udp_fd = -1;
+            return false;
+        }
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_ANY);
+        address.sin_port = htons(port);
+        if (bind(udp_fd, reinterpret_cast<sockaddr *>(&address), sizeof(address)) < 0) {
+            perror("bind");
+            close(udp_fd);
+            udp_fd = -1;
+            return false;
+        }
+        fprintf(stderr, "Listening for UDP input on port %u\n", port);
+        return true;
+    }
+
     void loadfile(uint16_t index, const char *path) {
 
         FILE *f = fopen(path, "rb");
@@ -854,6 +1240,15 @@ class CDi {
         time30mhz++;
         clock30();
 
+        // These are the hps_cd_sector_cache inputs, exported by the CDIC.
+        // Check immediately after its clock edge so the one-cycle valid pulse
+        // cannot be missed.
+        if (save_at_lba_enabled && dut.rootp->emu__DOT__cd_seek_lba_valid &&
+            dut.rootp->emu__DOT__cd_seek_lba == save_at_lba) {
+            save_at_lba_enabled = false;
+            RequestSave(SaveRequest::Lba);
+        }
+
 #ifdef SIMULATE_RC5
         if (time30mhz >= rc5_fliptime) {
             SetRcEye(rc5_nextstate);
@@ -872,8 +1267,9 @@ class CDi {
         }
 #endif
 
+        // Make a print of the current tick time with a frequency of 300 Hz (every 3.33ms)
         if ((time30mhz % 100000) == 0) {
-            printf("%d\n", time30mhz);
+            printf("Time %lu\n", time30mhz);
         }
 
         dut.rootp->emu__DOT__cd_media_change = (time30mhz == 1300000);
@@ -905,9 +1301,18 @@ class CDi {
                 assert(res == 0);
 
                 res = fread(hps_buffer, 1, kSectorSize, f_cd_bin);
-                assert(res == kSectorSize);
+                if (res != kSectorSize) {
+                    printf("fread failed with %d %s\n", res, strerror(errno));
+                }
 
                 check_scramble(lba, reinterpret_cast<uint8_t *>(hps_buffer));
+
+#if defined(TRACE) && defined(TRACE_ON_CD_REQUEST)
+                if (!do_trace) {
+                    fprintf(stderr, "Trace on by CD Request\n");
+                    do_trace = true;
+                }
+#endif
             } else {
                 // This is TOC area. Just zero all the data
                 memset(hps_buffer, 0, kSectorSize);
@@ -968,7 +1373,8 @@ class CDi {
         }
 
         dut.rootp->emu__DOT__sd_buff_wr = 0;
-        if (dut.rootp->emu__DOT__cd_hps_ack && (time30mhz % 180) == 15) {
+        // Data rate doesn't need to match, since the CD sector cache will do the throttle
+        if (dut.rootp->emu__DOT__cd_hps_ack && (time30mhz % 10) == 5) {
             if (hps_buffer_index == kWordsPerSector) {
                 dut.rootp->emu__DOT__cd_hps_ack = 0;
                 printf("Sector transferred!\n");
@@ -1066,16 +1472,38 @@ class CDi {
                 // We are at the beginning of IrqSrvc in fdrvs1. This means that A2 contains fdrvs1_static
                 uint32_t *cpu_a =
                     &dut.rootp->emu__DOT__cditop__DOT__scc68070_0__DOT__tg68__DOT__tg68kdotcinst__DOT__regfile[8];
-                dut.rootp->emu__DOT__cditop__DOT__fdrvs1_static = cpu_a[2];
+
+                if (dut.rootp->emu__DOT__cditop__DOT__fdrvs1_static != cpu_a[2]) {
+                    printf("fdrvs1_static set to %x", cpu_a[2]);
+                    dut.rootp->emu__DOT__cditop__DOT__fdrvs1_static = cpu_a[2];
+                }
             }
 
             if (m_pc == 0x0e5029a) {
                 // We are at the beginning of MA_Play in madriv. This means that A2 contains madriv_static
                 uint32_t *cpu_a =
                     &dut.rootp->emu__DOT__cditop__DOT__scc68070_0__DOT__tg68__DOT__tg68kdotcinst__DOT__regfile[8];
-                dut.rootp->emu__DOT__cditop__DOT__madriv_static = cpu_a[2];
+                if (dut.rootp->emu__DOT__cditop__DOT__madriv_static != cpu_a[2]) {
+                    printf("madriv_static set to %x", cpu_a[2]);
+                    dut.rootp->emu__DOT__cditop__DOT__madriv_static = cpu_a[2];
+                }
             }
 
+            if (m_pc == 0x00e4ee6c) {
+                // 00e4ee64 41 f1 20 70     lea        (0x70,A1,D2w*0x1),A0
+                // 00e4ee68 4a 68 00 00     tst.w      (0x0,A0)
+                // 00e4ee6c 66 08           bne.b      LAB_00e4ee76 <-- We are here
+                // This is part of MV_Info to get the location of MVmapDesc*
+                uint32_t *cpu_a =
+                    &dut.rootp->emu__DOT__cditop__DOT__scc68070_0__DOT__tg68__DOT__tg68kdotcinst__DOT__regfile[8];
+
+                if (dut.rootp->emu__DOT__cditop__DOT__mvmapdesc != cpu_a[0]) {
+                    printf("MVmapDesc set to %x", cpu_a[0]);
+                    dut.rootp->emu__DOT__cditop__DOT__mvmapdesc = cpu_a[0];
+                }
+            }
+
+            dut.rootp->emu__DOT__cditop__DOT__executing_dvc_rom_instructions = m_pc >= 0xe40000 && m_pc < 0xe7ffff;
 #if 0
             executing_dvc_rom_instructions = m_pc >= 0xe40000 && m_pc < 0xe7ffff;
 #endif
@@ -1111,58 +1539,33 @@ class CDi {
             dut.rootp->emu__DOT__cditop__DOT__mcd212_inst__DOT__video_x == 0) {
             char filename[100];
 
-#ifndef SIMULATE_RC5
-            if (dut.rootp->emu__DOT__tvmode_ntsc) {
-                // NTSC
-            } else {
-                // PAL
-                // space_ace_pal();
-                // braindead13_pal();
-                // lost_ride_pal();
-                // PressEvery5Frames();
-                // chaos_control_germany();
-                // PlayAudioCdInxListenLikeThieves();
-            }
-#endif
-
-            if (press_button1_signal) {
-                press_button1_signal = false;
-                release_button_frame = frame_index + 3;
-                printf("Press Button 1!\n");
-                fprintf(stderr, "Press Button 1!\n");
-                dut.rootp->emu__DOT__JOY0 |= 0b010000;
-            }
-
-            if (press_button2_signal) {
-                press_button2_signal = false;
-                release_button_frame = frame_index + 3;
-                printf("Press Button 2!\n");
-                fprintf(stderr, "Press Button 2!\n");
-                dut.rootp->emu__DOT__JOY0 |= 0b100000;
-            }
-
-            if (release_button_frame == frame_index) {
-                printf("Release buttons!\n");
-                fprintf(stderr, "Release buttons!\n");
-                dut.rootp->emu__DOT__JOY0 = 0b00000;
-            }
+            ApplyInputEvents();
+            ProcessPendingSignals();
 
             if (pixel_index > 400) {
                 auto current = std::chrono::system_clock::now();
-                std::chrono::duration<double> elapsed_seconds = current - start;
-                sprintf(filename, "%d/video_%03d.png", instanceid, frame_index);
-                write_png_file(filename);
-                printf("Written video_%03d.png\n", frame_index);
+                std::chrono::duration<double> elapsed_seconds_since_start = current - start_time;
+                std::chrono::duration<double> elapsed_seconds_since_last_frame = current - last_frame_time;
+                last_frame_time = current;
+
+                sprintf(filename, "%d/video_%03d.%s", instanceid, frame_index, write_png_frames ? "png" : "bmp");
+                if (write_png_frames ? !WriteRgbPng(filename, width, height, 4, output_image)
+                                     : !WriteRgbBmp(filename, width, height, 4, output_image))
+                    abort();
+                printf("Written video_%03d.%s\n", frame_index, write_png_frames ? "png" : "bmp");
                 // printf("We are at time30mhz=%ld\n", time30mhz);
 
                 uint32_t mpeg_frequency = mpeg_clk_calc_ticks * 30 / mpeg_clk_calc_ticks30;
 
                 // printf("Written %s after %.2fs. FMV at %d MHz\n", filename, elapsed_seconds.count(), mpeg_frequency);
-                fprintf(stderr, "Written %s after %.2fs. FMV at %d MHz\n", filename, elapsed_seconds.count(),
-                        mpeg_frequency);
+                fprintf(stderr, "Written %s after %.2fs, total %.2fs. FMV at %d MHz\n", filename,
+                        elapsed_seconds_since_last_frame.count(), elapsed_seconds_since_start.count(), mpeg_frequency);
 
                 mpeg_clk_calc_ticks30 = 0;
                 mpeg_clk_calc_ticks = 0;
+
+                if (frame_index == save_at_frame)
+                    RequestSave(SaveRequest::Frame);
 
                 if (frame_index == 120) {
                     ScanForOs9Modules();
@@ -1216,14 +1619,20 @@ class CDi {
 #ifdef TRACE
             // do_trace = true;
 #endif
-            sprintf(bmp_name, "%d/%03d.bmp", instanceid, fmv_frame_cnt);
-            printf("FMV Writing %s at Fifo Level %d at Frame Level %d\n", bmp_name,
+            sprintf(bmp_name, "%d/fmv_%03d.bmp", instanceid, fmv_frame_cnt);
+            printf("FMV Writing %s at Fifo Level %d at Frame Level %d %d %d %c %d\n", bmp_name,
                    dut.rootp->emu__DOT__cditop__DOT__vmpeg_inst__DOT__video__DOT__fifo_level,
-                   dut.rootp->emu__DOT__cditop__DOT__vmpeg_inst__DOT__video__DOT__pictures_in_fifo_clk_mpeg);
+                   dut.rootp->emu__DOT__cditop__DOT__vmpeg_inst__DOT__video__DOT__pictures_in_input_fifo,
+                   dut.rootp->emu__DOT__cditop__DOT__vmpeg_inst__DOT__video__DOT__pictures_in_mpeg_decoder,
+                   dut.rootp->emu__DOT__cditop__DOT__vmpeg_inst__DOT__video__DOT__pictures_in_output_fifo,
+                   GetPictureType(frame.picture_type), frame.temporal_ref);
             ;
-            fprintf(stderr, "FMV Writing %s at Fifo Level %d at Frame Level %d\n", bmp_name,
+            fprintf(stderr, "FMV Writing %s at Fifo Level %d at Frame Level %d %d %d %c %d\n", bmp_name,
                     dut.rootp->emu__DOT__cditop__DOT__vmpeg_inst__DOT__video__DOT__fifo_level,
-                    dut.rootp->emu__DOT__cditop__DOT__vmpeg_inst__DOT__video__DOT__pictures_in_fifo_clk_mpeg);
+                    dut.rootp->emu__DOT__cditop__DOT__vmpeg_inst__DOT__video__DOT__pictures_in_input_fifo,
+                    dut.rootp->emu__DOT__cditop__DOT__vmpeg_inst__DOT__video__DOT__pictures_in_mpeg_decoder,
+                    dut.rootp->emu__DOT__cditop__DOT__vmpeg_inst__DOT__video__DOT__pictures_in_output_fifo,
+                    GetPictureType(frame.picture_type), frame.temporal_ref);
 
             WriteBmp(bmp_name, w, h, pixels);
 
@@ -1250,10 +1659,12 @@ class CDi {
             if (dut.rootp->emu__DOT__cditop__DOT__vmpeg_inst__DOT__fmv_packet_body) {
                 fwrite(&dut.rootp->emu__DOT__cditop__DOT__vmpeg_inst__DOT__mpeg_data, 1, 1, f_fmv_m1v);
             }
-#ifdef TRACE
-            if (!do_trace)
-                fprintf(stderr, "Trace on!\n");
-            do_trace = true;
+#if defined(TRACE) && defined(TRACE_ON_FMV)
+            if (!do_trace && !do_trace_started_once_via_fmv) {
+                fprintf(stderr, "Trace on by FMV!\n");
+                do_trace = true;
+                do_trace_started_once_via_fmv = true;
+            }
 #endif
         }
         if (dut.rootp->emu__DOT__cditop__DOT__vmpeg_inst__DOT__fma_data_valid) {
@@ -1262,14 +1673,16 @@ class CDi {
             if (dut.rootp->emu__DOT__cditop__DOT__vmpeg_inst__DOT__fma_packet_body) {
                 fwrite(&dut.rootp->emu__DOT__cditop__DOT__vmpeg_inst__DOT__mpeg_data, 1, 1, f_fma_mp2);
             }
-#ifdef TRACE
-            if (!do_trace)
-                fprintf(stderr, "Trace on!\n");
-            do_trace = true;
+#if defined(TRACE) && defined(TRACE_ON_FMA)
+            if (!do_trace && !do_trace_started_once_via_fma) {
+                fprintf(stderr, "Trace on via FMA!\n");
+                do_trace = true;
+                do_trace_started_once_via_fma = true;
+            }
 #endif
         }
 
-        if (pixel_index < size - 6) {
+        if (pixel_index < size) {
             uint8_t r, g, b;
 
             r = g = b = 30;
@@ -1292,9 +1705,17 @@ class CDi {
             output_image[pixel_index++] = g;
             output_image[pixel_index++] = b;
         }
+
+        // Save only after all host-side work for this simulated tick has run.
+        // Verilator is quiescent here: the preceding dut.eval() calls returned.
+        CommitPendingSave();
     }
 
     virtual ~CDi() {
+        if (udp_fd >= 0)
+            close(udp_fd);
+        if (f_executed_events)
+            fclose(f_executed_events);
         assert(f_audio_right);
         assert(f_audio_left);
         assert(f_fma);
@@ -1360,6 +1781,16 @@ class CDi {
 
     CDi(int i) {
         instanceid = i;
+
+        char event_filename[] = "/tmp/cdi-input-events-XXXXXX";
+        const int event_fd = mkstemp(event_filename);
+        assert(event_fd >= 0);
+        f_executed_events = fdopen(event_fd, "w");
+        assert(f_executed_events);
+        fprintf(f_executed_events, "# Executed input events; reusable with --events\n");
+        fprintf(f_executed_events, "# Image: %s\n", mounted_image_path.c_str());
+        fflush(f_executed_events);
+        fprintf(stderr, "Recording executed input events to %s\n", event_filename);
 
         char filename[100];
         sprintf(filename, "%d/audio_left.bin", instanceid);
@@ -1427,10 +1858,11 @@ class CDi {
         dut.RESET = 0;
         dut.OSD_STATUS = 1;
 
-        start = std::chrono::system_clock::now();
-#ifdef TRACE
-        // do_trace = false;
-        // fprintf(stderr, "Trace off!\n");
+        start_time = std::chrono::system_clock::now();
+        last_frame_time = std::chrono::system_clock::now();
+#if defined(TRACE) && !defined(TRACE_FROM_START)
+        do_trace = false;
+        fprintf(stderr, "Trace off on start!\n");
 #endif
 
 #ifdef SIMULATE_RC5
@@ -1515,6 +1947,87 @@ class CDi {
 };
 
 int main(int argc, char **argv) {
+
+    const char *event_script = nullptr;
+    uint16_t udp_port = 0;
+    const char *load_state = nullptr;
+    const char *save_state = nullptr;
+    uint64_t save_frame = 0;
+    const char *save_lba_state = nullptr;
+    uint32_t save_lba = 0;
+    int machineindex = 0;
+    int positional_arguments = 0;
+    bool autoplay{false};
+    bool write_png_frames{false};
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--events") == 0) {
+            if (++i == argc) {
+                fprintf(stderr, "--events requires a path\n");
+                return 1;
+            }
+            event_script = argv[i];
+        } else if (strcmp(argv[i], "--load-state") == 0) {
+            if (++i == argc) {
+                fprintf(stderr, "--load-state requires a path\n");
+                return 1;
+            }
+            load_state = argv[i];
+        } else if (strcmp(argv[i], "--save-at-frame") == 0) {
+            if (i + 2 >= argc) {
+                fprintf(stderr, "--save-at-frame requires a frame and path\n");
+                return 1;
+            }
+            char *end = nullptr;
+            save_frame = strtoull(argv[++i], &end, 10);
+            if (*end != '\0') {
+                fprintf(stderr, "Invalid save frame: %s\n", argv[i]);
+                return 1;
+            }
+            save_state = argv[++i];
+        } else if (strcmp(argv[i], "--save-at-lba") == 0) {
+            if (i + 2 >= argc) {
+                fprintf(stderr, "--save-at-lba requires an LBA and path\n");
+                return 1;
+            }
+            char *end = nullptr;
+            const unsigned long long lba = strtoull(argv[++i], &end, 0);
+            if (*end != '\0' || lba > UINT32_MAX) {
+                fprintf(stderr, "Invalid save LBA: %s\n", argv[i]);
+                return 1;
+            }
+            save_lba = lba;
+            save_lba_state = argv[++i];
+        } else if (strcmp(argv[i], "--udp") == 0) {
+            if (++i == argc) {
+                fprintf(stderr, "--udp requires a port\n");
+                return 1;
+            }
+            char *end = nullptr;
+            const long port = strtol(argv[i], &end, 10);
+            if (*end != '\0' || port < 1 || port > 65535) {
+                fprintf(stderr, "Invalid UDP port: %s\n", argv[i]);
+                return 1;
+            }
+            udp_port = static_cast<uint16_t>(port);
+        } else if (strcmp(argv[i], "--auto") == 0) {
+            autoplay = true;
+        } else if (strcmp(argv[i], "--png") == 0) {
+            write_png_frames = true;
+        } else if (strcmp(argv[i], "--help") == 0) {
+            fprintf(stderr,
+                    "Usage: %s [machine] [--auto] [--png] [--events script] [--udp port] [--load-state file] "
+                    "[--save-at-frame frame file] [--save-at-lba lba file]\n",
+                    argv[0]);
+            return 0;
+        } else if (positional_arguments++ == 0) {
+            machineindex = atoi(argv[i]);
+        } else {
+            fprintf(stderr, "Unexpected argument: %s\n", argv[i]);
+            return 1;
+        }
+    }
+
     // Initialize Verilators variables
     Verilated::commandArgs(argc, argv);
 
@@ -1523,7 +2036,7 @@ int main(int argc, char **argv) {
         Verilated::traceEverOn(true);
 #endif
 
-    struct sigaction sa;
+    struct sigaction sa{};
     sa.sa_sigaction = SignalHandler;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = SA_SIGINFO;
@@ -1532,54 +2045,62 @@ int main(int argc, char **argv) {
     sigaction(SIGUSR1, &sa, NULL);
     sigaction(SIGUSR2, &sa, NULL);
 
-    int machineindex = 0;
-
-    if (argc >= 2) {
-        machineindex = atoi(argv[1]);
+    if (positional_arguments >= 1) {
         fprintf(stderr, "Machine is %d\n", machineindex);
     }
 
     switch (machineindex) {
     case 0:
-        f_cd_bin = fopen("images/inxs.bin", "rb");
-        prepare_inxs_listen_like_thieves_audiocd_toc();
+        mount_image("images/nimh.bin");
         break;
     case 1:
-        f_cd_bin = fopen("images/aims_frogs.iso", "rb");
+        mount_image("images/aims_frogs.iso");
         prepare_artificial_audiocd_toc();
         break;
     case 2:
-        f_cd_bin = fopen("images/LuckyLuke.bin", "rb");
-        prepare_lucky_luke_europe_toc();
+        mount_image("images/CDICTEST.BIN");
         break;
     case 3:
-        f_cd_bin = fopen("images/Zelda Wand of Gamelon.bin", "rb");
+        mount_image("images/Zelda Wand of Gamelon.bin");
         break;
     case 4:
-        f_cd_bin = fopen("images/christ_country.bin", "rb");
+        mount_image("images/christ_country.bin");
         break;
     case 5:
-        f_cd_bin = fopen("images/startrek.bin", "rb");
+        mount_image("images/lost_ride.bin");
         break;
     case 6:
-        f_cd_bin = fopen("images/FMVTEST.BIN", "rb");
+        mount_image("images/FMVTEST.BIN");
         break;
     case 7:
-        f_cd_bin = fopen("images/7thguest_german.bin", "rb");
+        mount_image("images/FMVTEST.BIN");
         break;
     case 8:
-        f_cd_bin = fopen("images/Dragon_s_Lair_US.bin", "rb");
+        mount_image("images/Dragon_s_Lair_US.bin");
         break;
     case 9:
-        f_cd_bin = fopen("images/space_ace_eu.bin", "rb");
+        mount_image("images/space_ace_eu.bin");
         break;
     }
 
-    assert(f_cd_bin);
-
     CDi machine(machineindex);
 
-    machine.dut.rootp->emu__DOT__config_auto_play = argc >= 3 ? 1 : 0;
+    if (load_state && !machine.LoadState(load_state))
+        return 1;
+    if (save_state)
+        machine.SetSaveAtFrame(save_frame, save_state);
+    if (save_lba_state)
+        machine.SetSaveAtLba(save_lba, save_lba_state);
+
+    if (write_png_frames)
+        machine.EnablePngFrames();
+
+    if (event_script && !machine.ReplaceInputEventsFromScript(event_script))
+        return 1;
+    if (udp_port && !machine.EnableUdpInput(udp_port))
+        return 1;
+
+    machine.dut.rootp->emu__DOT__config_auto_play = autoplay;
     if (machine.dut.rootp->emu__DOT__config_auto_play) {
         fprintf(stderr, "Autoplay enabled!\n");
     } else {
@@ -1597,7 +2118,8 @@ int main(int argc, char **argv) {
     machine.DumpDvcSysMemory();
     machine.dump_slave_memory();
 
-    fclose(f_cd_bin);
+    if (f_cd_bin)
+        fclose(f_cd_bin);
 
     fprintf(stderr, "Closing...\n");
     fflush(stdout);

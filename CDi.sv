@@ -218,27 +218,29 @@ module emu (
         "-;",
 
         "P1,Audio & Video;",
-        "P1O[4],Video Region,PAL,NTSC;",
+        "P1O[4],Video Region,PAL (50 Hz),NTSC (60 Hz);",
         "P1O[33:32],Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
         "P1O[35:34],Scale,Normal,V-Integer,Narrower HV-Integer,Wider HV-Integer;",
         "P1O[39],Vertical Crop,Off,On(270);",
+        "P1O[40],CLUT Bits,Original(18),24;",
         "P1O[10:9],RGB Scale,0-255,16-235,16-255;",
+        "P1-;",
+        "P1O[26:24],Audio Mixing,Original,CDIC unmixed,VMPEG unmixed,VMPEG Left,VMPEG Right;",
 
         "P2,Debug Options;",
         "P2-;",
         "P2F1,ROM,Replace Boot ROM;",
-        "P2O[2],Disable Audio Att.,No,Yes;",
-        "P2O[3],UART Fake Space,No,Yes;",
         "P2O[7:6],Force Video Plane,Original,A,B,DVC;",
-        "P2O[12],SERVO Audio CD,No,Yes;",
         "P2O[17],Disable VCD pixel clock,No,Yes;",
         "P2O[18],Activate VCD filter,Yes,No;",
-        "P2O[19],CD image live update,No,Yes;",
+        "P2O[27],CD image live update,No,Yes;",
+        "P2O[12],SERVO Audio CD,No,Yes;",
+        "P2O[3],UART Fake Space,No,Yes;",
 
         "P3,Hardware Config;",
         "P3-;",
         "P3O[15],Ports,P1 Front + UART Back,P1 Back + P2 Front;",
-        "P3O[21:20],SNAC,Disabled,Only Ir RC5,Front Split Port,Back Port;",
+        "P3O[23:22],SNAC,Disabled,Only Ir RC5,Front Split Port,Back Port;",
         "P3O[5],Overclock input device,No,Yes;",
         "P3O[13],Disable VMPEG DVC,No,Yes;",
         "P3-;",
@@ -270,10 +272,10 @@ module emu (
 
     wire [ 10:0] ps2_key;
 
-    wire [ 15:0] JOY0  /*verilator public_flat_rw*/;
-    wire [ 15:0] JOY1  /*verilator public_flat_rw*/;
-    wire [ 15:0] JOY0_ANALOG  /*verilator public_flat_rw*/;
-    wire [ 15:0] JOY1_ANALOG  /*verilator public_flat_rw*/;
+    bit  [ 15:0] JOY0  /*verilator public_flat_rw*/;
+    bit  [ 15:0] JOY1  /*verilator public_flat_rw*/;
+    bit  [ 15:0] JOY0_ANALOG  /*verilator public_flat_rw*/;
+    bit  [ 15:0] JOY1_ANALOG  /*verilator public_flat_rw*/;
 
     wire [ 24:0] MOUSE  /*verilator public_flat_rw*/;
 
@@ -327,7 +329,66 @@ module emu (
         nvram_media_change_q <= nvram_media_change;
     end
 
-`ifndef VERILATOR
+
+
+`ifdef VERILATOR
+    bit debug_uart_fake_space  /*verilator public_flat_rw */;
+    bit tvmode_ntsc  /*verilator public_flat_rw */;
+    bit overclock_pointing_device = 1;
+    bit [1:0] debug_force_video_plane = 0;
+    bit enable_reset_on_nvram_img_mount = 0;
+    bit enable_reset_on_cd_img_mount = 0;
+    bit [1:0] debug_limited_to_full  /*verilator public_flat_rw */ = 0;
+    bit audio_cd_in_tray  /*verilator public_flat_rw */ = 0;
+    bit config_disable_cpu_starve  /*verilator public_flat_rw */ = 1;
+    bit config_rgb888  /*verilator public_flat_rw */ = 1;
+    bit config_auto_play  /*verilator public_flat_rw */ = 1;
+    bit config_disable_vmpeg = 0;
+    bit config_first_player_back_port = 0;
+    bit config_disable_seek_time  /*verilator public_flat_rw */ = 1;
+    bit debug_disable_vcd_clock = 0;
+    bit debug_activate_vcd_filter = 1;
+    bit [2:0] pointing_dev_speed = 0;
+    wire snac_enable_split_port = 0;
+    wire snac_enable_infrared = 0;
+    wire [2:0] config_audio_mixing = 0;
+    wire [1:0] snac_mode = 0;
+`else
+    // !!! All status flags must be used here in order to ensure that nothing overlaps !!!
+
+    // Status seems to be all zero after reset
+    // Should be considered for defining the default
+    wire debug_uart_fake_space = status[3];
+    wire tvmode_ntsc = status[4];
+    wire overclock_pointing_device = status[5];
+    wire [1:0] debug_force_video_plane = status[7:6];
+    wire enable_reset_on_nvram_img_mount = !status[8];
+    wire [1:0] debug_limited_to_full = status[10:9];
+    wire config_disable_cpu_starve = status[11];
+    wire config_rgb888 = status[40];
+    wire audio_cd_in_tray = status[12];
+    bit config_disable_vmpeg = 0;  // synced status[13];
+    wire config_auto_play = !status[14];
+    wire config_first_player_back_port = status[15];
+    wire config_disable_seek_time = status[16];
+    wire debug_disable_vcd_clock = status[17];
+    wire debug_activate_vcd_filter = !status[18];
+    wire [2:0] pointing_dev_speed = status[21:19];
+    wire [1:0] snac_mode = status[23:22];
+    wire snac_enable_split_port = snac_mode == 2;
+    wire snac_enable_infrared = snac_mode != 0;
+    wire [2:0] config_audio_mixing = status[26:24];
+    wire enable_reset_on_cd_img_mount = !status[27];
+
+    wire [1:0] ar = status[33:32];
+    wire [1:0] video_freak_scale = status[35:34];
+    wire vcrop_en = status[39];
+
+    always_ff @(posedge clk_sys) begin
+        // only change during resets
+        if (cditop_reset) config_disable_vmpeg <= status[13];
+    end
+
     hps_io #(
         .CONF_STR(CONF_STR),
         .WIDE(1),
@@ -380,9 +441,6 @@ module emu (
         .RTC(hps_rtc)
     );
 
-    wire [1:0] ar = status[33:32];
-    wire vcrop_en = status[39];
-
     video_freak video_freak (
         .*,
         .VGA_DE_IN(~(HBlank | VBlank)),
@@ -390,9 +448,8 @@ module emu (
         .ARY((!ar) ? 13'd3 : 13'd0),
         .CROP_SIZE(vcrop_en ? 10'd270 : 10'd0),
         .CROP_OFF(0),
-        .SCALE(status[35:34])
+        .SCALE(video_freak_scale)
     );
-
 `endif
 
     ///////////////////////   CLOCKS   ///////////////////////////////
@@ -592,6 +649,7 @@ module emu (
         else if (cd_hps_req) cd_hps_req_during_power_cycle <= 1;
     end
 
+    /* verilator tracing_off */
     sdram sdram (
         .*,
         .init(0),  //~clock_locked),
@@ -608,6 +666,7 @@ module emu (
         .burst(prepare_sdram ? 1'b0 : sdram_burst),
         .burstdata_valid(sdram_burstdata_valid)
     );
+    /* verilator tracing_on */
 
 `ifdef VERILATOR
     // DDR3 simulation
@@ -721,52 +780,6 @@ module emu (
     end
 `endif
 
-`ifdef VERILATOR
-    bit debug_uart_fake_space  /*verilator public_flat_rw */;
-    bit tvmode_ntsc  /*verilator public_flat_rw */;
-    bit overclock_pointing_device = 1;
-    bit [1:0] debug_force_video_plane = 0;
-    bit enable_reset_on_nvram_img_mount = 0;
-    bit enable_reset_on_cd_img_mount = 0;
-    bit [1:0] debug_limited_to_full = 0;
-    bit audio_cd_in_tray  /*verilator public_flat_rw */ = 0;
-    bit config_disable_cpu_starve  /*verilator public_flat_rw */ = 1;
-    bit config_auto_play  /*verilator public_flat_rw */ = 1;
-    bit config_disable_vmpeg = 0;
-    bit config_first_player_back_port = 0;
-    bit config_disable_seek_time  /*verilator public_flat_rw */ = 1;
-    bit debug_disable_vcd_clock = 0;
-    bit debug_activate_vcd_filter = 1;
-    bit [2:0] pointing_dev_speed = 0;
-    wire snac_enable_split_port = 0;
-    wire snac_enable_infrared = 0;
-`else
-    // Status seems to be all zero after reset
-    // Should be considered for defining the default
-    wire debug_uart_fake_space = status[3];
-    wire tvmode_ntsc = status[4];
-    wire overclock_pointing_device = status[5];
-    wire [1:0] debug_force_video_plane = status[7:6];
-    wire enable_reset_on_nvram_img_mount = !status[8];
-    wire enable_reset_on_cd_img_mount = !status[19];
-    wire [1:0] debug_limited_to_full = status[10:9];
-    wire config_disable_cpu_starve = status[11];
-    wire audio_cd_in_tray = status[12];
-    bit config_disable_vmpeg = 0;
-    wire config_auto_play = !status[14];
-    wire config_first_player_back_port = status[15];
-    wire config_disable_seek_time = status[16];
-    wire debug_disable_vcd_clock = status[17];
-    wire debug_activate_vcd_filter = !status[18];
-    wire [2:0] pointing_dev_speed = status[21:19];
-    wire snac_enable_split_port = status[21:20] == 2;
-    wire snac_enable_infrared = status[21:20] != 0;
-
-    always_ff @(posedge clk_sys) begin
-        // only change during resets
-        if (cditop_reset) config_disable_vmpeg <= status[13];
-    end
-`endif
 
     wire HBlank;
     wire HSync;
@@ -820,6 +833,7 @@ module emu (
     wire cd_data_valid;
     wire cd_stop_sector_delivery;
 
+    /* verilator tracing_off */
     hps_cd_sector_cache hps_cd_sector_cache (
         .clk(clk_sys),
         .reset(cditop_reset),
@@ -842,6 +856,7 @@ module emu (
 
         .config_disable_seek_time
     );
+    /* verilator tracing_on */
 
     wire forced_snac_rts;
     wire forced_rts_flag;
@@ -858,7 +873,7 @@ module emu (
 
     rts_forcer rtsforcer (
         .clk(clk_sys),
-        .config_state({status[21:20], config_first_player_back_port}),
+        .config_state({snac_mode, config_first_player_back_port}),
         .rts_flag(forced_rts_flag),
         .rts_snac(forced_snac_rts)
     );
@@ -946,7 +961,7 @@ module emu (
         .debug_force_video_plane,
         .debug_limited_to_full,
         .audio_cd_in_tray,
-        .debug_disable_audio_attenuation(status[2]),
+        .config_audio_mixing,
 
         .ce_pix(ce_pix),
 
@@ -1012,6 +1027,7 @@ module emu (
         .fail_not_enough_words(fail_not_enough_words),
         .fail_too_much_data(fail_too_much_data),
         .config_disable_cpu_starve,
+        .config_rgb888,
         .config_auto_play,
         .config_disable_vmpeg(config_disable_vmpeg),
 
